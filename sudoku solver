@@ -1,0 +1,49 @@
+a journey of redundant over-optimisation: branchless sudoku solver
+
+
+This tale needs some context:
+back in about 2007 I had a conversations with a project-lead programmer friend who told me about a race he'd had with a sudoku fanatic. He claimed he'd be able, in less time than it took to complete a single hard sudoku, to write a program to solve all sudoku. he explained that it worked by "just guessing" in a methodical way, and although I was a noob at programming and not interested in sudoku, it got me thinking. it got me kinda obsessed with understanding the problem-space of sudoku, and resulted in me doing sudoku from time to time, determined that I could find a better, more efficient, way to solve them algorithmically than "just guessing".
+
+skip forward 15 years and I have a weirdly broken version of the sudoku puzzle app installed with my OS: for whatever reason the buttons to undo moves, reset the puzzle, or even start a new one are missing. If I ever make a mistake I'm stuck with it, even closing the app and re-opening just brings back the same mistaken puzzle. I could uninstall the app and install a different one, there are plenty, but intead I decide that "I'll finally do it: I'll write the sudoku solver I've been thinking about all these years".
+
+I start thinking about all the techniques I use to solve sudoku myself, and quickly realise that they all involve (from a computers perspective) lots of work, scanning and rescanning the entire grid looking for the sole-option squares to fill in. I realised that the most efficient way for a computer to solve sudoku was by "just guessing", in a methodical way. So I wrote that sudoku solver.
+
+the basic principle is simple: start at the top left square and proceed accross the columns, then row by row down when each is filled. If the square is empty, look at the row column and box it is part of and see what options it has available. if there are no options possible for that square, clear it and go back to the previous square and try the next option there, if no options remain (all tried) go back again, and so on, until all squares are filled.
+
+V1: first go
+literally just enters numbers from 1 to 9 in a square and checks row, column, box, for duplicates. nothing clever. It works, with no noticable delay, and I get the solution to the sudoku locked into my puzzle app, and can enter it and move on to a new puzzle. Yaay!
+
+at this point I have a working sudoku solver which takes at most a few milliseconds to run, but I look at it and feel awful about how inefficient the code is at doing what is required. It tries all options for a square, checking each one with loads of repeated work, branching to go back or forward, looping to skip over original puzzle values. I'd made something awful and it itched in my mind. I could do better.
+
+V2: a bit better, but not much:
+I combined the checking loops so that all 3 were done simultaneously rather than one at a time. not a big improvement.
+
+V3: a big move in the right direction:
+I stopped using loops to scan the rows and columns and squares for each try, and instead set up 3 arrays for the rows, columns and squares having a bitmask of taken options. This means no looping over the puzzle every try, just add/remove/combine bits to work out what the available options for a square are, if any. Also removed the skipping loop by having a pre-skipped list of open squares. But there's still a branch between going forward and back, and I'm continually switching from numeric to bitwise representations of the puzzle.
+
+V4: removed a goto
+literally the only change: don't remember why I called this a different version. I realised there was an if/goto that could be a while loop.
+
+V5: finally branchless
+I realised that whether going forward or backward, the same things needed to be read, combined and written, whatever. but I never even compiled it, since I though of a few more refinements to do for version 6...
+
+V6: no more numerics
+switching back and forth from number to bitwise just to store the trial entries seemed unneccesary, so I just stored the bit. More useful that way anyway.
+
+Operational description:
+
+so heres how it goes:
+after scanning the puzzle to enter the given numbers into the availability bitmaps for row, column and box, and generate the list of empty squares to be filled, it enters a loop that only ends when the puzzle is either solved or is shown to have no solution.
+in that loop, the current content of the current square and its row, column, box bitmasks are loaded. the bit read from the puzzle is inverted into a mask to remove it from the row,column and box bitmasks, and also to generate an "already tried" mask of all bits upto and including the one just read. these 4 are combined into a "taken|tried" mask, then inverted into an "available" mask. the square increment is -1 if this mask turns out to be zero, otherwise 1, and if adding it goes negative then the solve fails. Otherwise we pick the lowest bit of the "available" mask, write it to the puzzle, and add it to the row, column and box bitmasks before writing them back too.
+when going forward, the bit read from the puzzle square is zero, nothing gets removed from the row, column or box masks, the tried mask is zero too, and the first available option is tried. when going back, the available-options mask is zero and this gets written to the puzzle, leaving it clear for the next forward move with the prior parts of the puzzle changed.
+
+In the cases where there's only one option remaining for a square, it enters that option and goes forward, and retreats just as fast if there's no options up ahead. it decides on forward/reverse early so it can get it's next cycles memory-reads underway even before finishing the writes of the current one, so the loop time is about 23 clock cycles. it takes about 1000 loops to solve a puzzle, so solving time is about 7µs.
+
+V7: assembly
+I'd gone about as far as C could take me, and so I went the final mile with assembly.
+
+After converting the logic of the C code to assembly using what I believe to be the most efficient combinations of operations possible, I realised that there were extra array lookups needed because I was still using the open-squares-index table to look up the bits from the puzzle, and then using that to look up the row/column/square references from those tables as well. So I switched to a combined puzzle array that stored the various indexes and the current tried entries all in one array. this reduced the latency of the loop to 15cc, giving a solve time of about 4.5µs on my agèd 3.3GHz skylake laptop.
+
+finally satisfied, I have what I believe to be the fastest possible sudoku solver. I also have no desire left to solve sudoku.
+
+

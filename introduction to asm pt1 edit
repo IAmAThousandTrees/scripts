@@ -1,0 +1,277 @@
+It has struck me that there is a dearth of real knowledge on assembly language programming on youtube, and there is a general opinion in the world that asm, and x86 in particular, is hard... I hope to correct both of these in the following set of videos. What I will not be covering is anything related to OPSEC or hacking, since they are both outside my zones of expertise and interest.
+
+Maybe you're interested in performing detailed asm optimisations of the core kernels of your code, maybe your just curious how modern CPU's manage their magic, and maybe you're just hoping to glean some understanding that will help you in your use of higher level languages to write code that is better suited to modern CPU's. In any case, I hope you will learn something ;). That said, I intend this and the following video's to be a distillation, an overview, a starting-point for understanding, and a transmission of the mental images that serve me so well, not a replacement for the documentations that I reference. I strongly recomend doing your own reading to get the details. Maybe you'll notice something I've so-far missed.
+
+x86, and x86_64 (sometimes referred to as x64, or amd64) isn't hard, but it is big, and therefore looks confusing to a beginner. Coding entire apps in asm is also daunting, and pretty pointless in my opinion, so I recommend building an IO framework in C (can just be printf/stdout) that will show some result from the small asm functions you write in the beginning, learning tecniqes of integrating asm routines into other languages as you do. The point of learning asm is to be able to write code that can do the process you need as quickly as it is possible for your CPU to do it, but that mostly comes down to the innermost loops of the process, the parts that will be run millions or billions of times, which can each be turned into its own asm function, in separate files, then linked into the main C program by your IDE for testing/debugging.
+
+So the first step is to understand how to manage that in your IDE. I personally use CODE::BLOCKS, which has decently easy integration of nasm compiled asm into the environment. Full instructions on how to set this up are in >THIS< video, along with links to my github for a modified asm lexer file that knows about zmm registers and vector instructions.
+
+Next comes knowing how to write asm that integrates with the C code. I will cover how this works in Linux, but if you are targeting Windows then although the principle is the same the details of register assignment of parameters are different. You can find Microsoft's C ABI (application binary interface) >HERE<.
+
+When a function is called (using the call instruction which pushes a return address to the stack) the CPU just arrives at the beginning of your code, and starts to execute it, and expects your code to be able to deal with that. The calling code will have put any parameters it's supposed to have given you (defined by the function declaration of your asm function in the C code) in certain registers for you to find, so that will be your starting point. But before we can talk about that you need to know about registers.
+
+x86_64 has 16 General Purpose Registers (GPRs), which can be used for various math, logic, and address calculation purposes, 15 of which can be used for whatever you'd like, and the last one is the Stack Pointer. Technically, there's nothing stopping you from using the stack pointer as well, but you'd have to store its contents somewhere in memory that you can find without referencing the stack pointer, and recall it later, otherwise you'd never be able to return from your function! (the stack pointer must point at the same address it did at the start of the function, which is the place in memory where the return address is stored - placed there by CALL and retrieved by RET).
+
+These named registers are effectively your local variables in asm, that all instructions will operate on. Although it is possible to use instructions to affect memory directly, only one memory operand is possible per instruction, and memory is much MUCH slower than registers, so most of the time, unless there's a good reason to do otherwise, data from memory will be loaded into registers and then operated on by a series of instructions, and then written back to memory when it's done.
+
+The naming of the GPRs in x86_64 is a bit of a hodgepodge, mostly meaningless history, related to special functions the original 16-bit registers had back in the 1970s. the first 4 were called a,b,c, and d, with h or l added to refer to the top or bottom half, or x added to indicate the whole thing: thus al,ah,ax are all the a register. there was also sp (stack pointer) bp (base pointer) di, and si, which were all 16-bit only registers used for addresses. Then 32-bit happened and to indicate that you wanted to access the extended 32-bit version of the register you put an e in front of the 16-bit name, so eax, ebx, ecx, edx, esp, ebp, edi, esi. Since all these registers were the same 8 registers, any change to the byte (8-bit) or word (16-bit) version of it would be reflected in the dword (32-bit) version, and vice versa, which is less good than it seems, but we'll learn about dependencies and out-of-order execution later.
+
+Then AMD decided that 64-bit was the next big thing, and the e became an r to indicate 64-bit registers, and 8 more registers were added, with just the r and a number: r8,r9,r10...r15. The new 8 registers could also be accessed as 32, 16, or 8-bits by adding an extra letter, r8d, r8w, r8b for dword word and byte. AMD also, wizely, broke the tradition of merging changes in smaller register version into the larger ones, and declared that any use of 32-bit or smaller, would clear the top half of the register to zero.
+
+to summarise: we have a,b,c,d,sp,bp,di,si,r8,r9,r10,r11,r12,r13,r14,r15 as registers, with letters added (l,h,x,e,r;b,w,d, ) to indicate how much of the register we mean to use.
+
+So now we know about all these registers, we can get back to the linux C ABI, which is fairly straightforward.
+
+The first 6 integer or pointer parameters that you pass to a function in C are placed, in this order, into: rdi, rsi, rdx, rcx, r8, r9. Further integer parameters will get pushed onto the stack before the function call return address. Floating point parameters will be passed in xmm0 to xmm7, the original SSE registers. An integer or pointer return value is put into rax before returning. The stack pointer is the stack pointer as mentioned before, but other than that the rbx, rbp, r12, r13, r14 and r15 registers may have data in them that the caller (the outer C program) will expect to still be there when you return, so if you need to use those then push them to the stack and pop them back off at the end. All others are fair game.
+
+The stack is a last-in-first-out memory area used implicitly by the push, pop, call and ret instructions, and explicitly as pre-allocated memory by mov and other instructions with memory operands. Push decrements rsp by the size of the register being pushed (8 if 64-bit, 4 if 32-bit etc), then uses the new address in [rsp] to store the register contents. Pop reverses the process, reading the data at [rsp] then incrementing rsp by the size of the register. In this way rsp always points at the last thing pushed and not yet popped from the stack. Call implicitly pushes the program counter (PC) (the address of the next instruction to be executed after the call) to the stack, replacing PC with whatever is specified in its operand, which can be an immediate offset, or register or memory-indirect address, of more executable code. The ret instruction reverses this, popping the top item on the stack into PC, so that the next instruction after the call it is returning from is the next to be executed.
+
+so now imagine we have a little function declared in C as:
+
+extern int add(int a, int b); 
+		// extern tells C not to expect to see the declared function defined anywhere in its source files, but to leave it to the linker to find.
+		// for C++, add a "C" (quote marks included) to switch off C++ name-mangling and look for the given name as-is
+
+we could implement this function that just adds two numbers in an asm function as:
+
+global add						; tells the assembler to make the add label visible to the linker
+section .text					; what comes after here is code to be assembled
+add:							; the add label points to the next instruction
+	mov		eax, edi			; copy a to the return-value register
+	add		eax, esi			; add b into the return-value register
+	ret							; return to caller
+
+or like this:
+
+
+add:
+	add		esi, edi			; add a to b
+	mov		eax, esi			; copy b to return-value register
+	ret
+
+
+The mov instruction is probaly the most used of all instructions since it is the universal data mover. Slightly missnamed, it copies whatever is in the second operand to the first operand, duplicating the source data and overwriting the destination register or memory's previous contents. I will exlusively be using intel format for asm, AT&T format is horrible for everything except internal use by compilers. In intel format, the first specified operand, whether memory or register, is always the destination where the result will be put. It is mostly one of the sources as well, where data is drawn from. In this way, an instruction will take a register, combine its data in some way with some other data, and then overwrite it. There are a few GPR instructions that have 3 or more operands and don't use the destination as one of it's sources, but this is quite rare, so if you still need the original value mov is used to duplicate it first. The exception to this is that nearly all vector instructions from AVX on have a separate destination register (unless they have 3 sources, in which case the destination is also a source).
+
+One other notable exeption to the first source overwriting generality of x86_64 is LEA: load effective address. although this is framed as a memory operation, rather than reading memory it instead does the address calculation and returns that result directly into a register. Since x86_64 addresses are quite complex allowing for 3 parts to be combined without overwriting any of its sources, this makes LEA a very useful instruction for general arithmatic. Our little add routine could therefore be implemented like this:
+
+add:
+	lea		eax, [edi + esi]	; add a and b and put result in return-value register
+	ret
+
+as mentioned, memory operands can have up to 3 parts, designated as base address, index, and offset. the base address and index are register values, the offset is an immediate constant set at compile time. The index can optionally be multiplied by 2, 4 or 8 as well, and the three are added together to get the final address that will be accessed. Not all of these elements have to be present, there can be just the base, just base and index, just base and offset, or all three. It makes no difference if the operation is accessing memory, but if all three are used for an lea instruction it takes 3 cycles to complete instead of one.
+
+sometimes it is not obvious from the rest of the instruction what the size of the memory being accessed is, whether 1,2,4 or 8 bytes. In those cases one would specify using the word for that data size before the brackets of the memory operand, eg
+
+	movsx	rax, word [rdi]		; sign extend to 64-bits the 16-bit value in memory at the address held in rdi and place result in rax
+
+it is worth noting that in 64-bit mode, only 64-bit registers can be used to specify addresses, including the index part.
+
+
+
+Most arithmetic and logic ops set flags. flags are 1-bit indicators passing information about what happened in an instruction to subsequent instructions, until another flag-setting instruction changes them. x86 defines quite a few flags, but the important ones are sign, carry, and zero. overflow is sometimes useful too, when handling signed numbers. A few arithmetic and logic ops also read the carry flag and use it in their calculation, but mostly flags are used for their effect on program flow by the j(cc) family of operations (jump if condition code is true), their effect on the cmov(cc) family to conditionaly replace some data in a register, and sometimes to affect math operations via the set(cc) family. since none of these affect the flags themselves, a series of conditional jumps, cmovs and sets can be created dealing with various different possible results of a single flag-setting operation. The (cc)'s get replaced by the 1/2/3-letter condition-codes which are written as part of the instruction, like jz for jump if zero or cmovc for conditional move if carry. There are really only 8 conditions, and their opposites, but they have many names, for example jz (jump if zero) is the same instruction as je (jump if equal). My preference is for using the name that most directly describes the flag states that activate it.
+
+The zero flag is set whenever the result of an arithmetic or logical operation was zero.
+The sign flag is set the same as the top (most significant) bit of the result of an arithmetic or logical operation. usually, this bit, and therefore the sign flag, means that the result should be interpreted as negative.
+The carry flag changes it's meaning depending on what the preceding flag-setting operation was. If it was an addition, then the carry flag indicates that the numbers added resulted in a carry out of the topmost bit in the sum, in other words the result was too big for the register. In the case of addition, if you then do another add-with-carry, then the carry gets fed in at the least-significant end of the new operation, allowing additions that are wider than a single register by using the carry flag to transmit that single bit of information. Other instructions use it in ways that make sense to those instructions, like a shift puts the last bit to be shifted out at either end into the carry flag. Most notably the subtract instruction, and by extension compare as well, uses the carry flag to represent a Borrow, in other words that the right-hand operand was greater than the left-hand one (in pure unsigned interpretation), and so the result transitioned to being negative in signed interpretation. It is not set if the left-hand operand was already negative, unless the right hand one is also negative but less negative, and the result still ends up negative. Simmilarly, the subtract-with-borrow instruction only borrows (subtracts) the extra 1 if the carry flag is set.
+The overflow flag indicates that the operation was too large for the register for signed arithmetic. For signed addition this is when adding two positive numbers results in the top bit being set indicating a negative result. There is no signed or unsigned addition, the carry indicates unsigned overflow, the overflow indicates signed overflow. Multiply operations use the overflow flag in different ways depending on the instruction used.
+
+The j(cc)s are used to produce all the variety of loops and conditional blocks of C and higher languages, and the cmov(cc)s and set(cc)s are used to avoid using j(cc)s, if at all possible. I will explain the reasons for this in a later section, but for now a basic loop might look like this:
+
+;; the C pattern:
+;; extern int filterOdd(int *data, int n_data); // remove all non-odd elements from an array, returns new length
+
+filterOdd:
+	lea			rdx, [rdi + rsi * 4]		; pointer to one-past-the-end of the input array in rdx
+	neg			rsi							; 64-bit negative of the array length so when they're added again the result is the start of the array
+	xor			eax, eax					; clear eax to take the index of where the filtered data is getting written to, which will also be the return value
+.loop:
+	mov			ecx, [rdx + rsi * 4]		; read 32-bit data
+	mov			[rdi + rax * 4], ecx		; write 32-bit data
+	test		ecx, 1						; test for oddness
+	setnz		r8b							; set r8b = 1 if odd, otherwise zero
+	movzx		r8d, r8b					; zero extend to 64-bits
+	add			eax, r8d					; increments the write index only if odd. even data will get overwritten.
+	add			rsi, 1						; increments the (negative) read index towards zero (end of the data)
+	jl			.loop						; while the read index is still negative (sign flag set) keep looping
+	
+	ret										; the return value is already in eax, no registers that the caller expects to be there have been overwritten,
+											; so there's nothing else to do and we can just return.
+
+this little filter routine would work and be reasonably quick, but it's not the best we can do: the test for oddness in the middle uses set, which has a major flaw: it can only write byte data. this means that what it puts out must be merged with the previous contents of the register, creating a dependency on the register's prior value if it is to be used at a wider width, and requiring the rest of the register to be cleared either before or after the set instruction. In this case there's another option avoiding set, which involves using the carry flag:
+
+.loop:
+	mov			ecx, [rdx + rsi * 4]		; read 32-bit data
+	mov			[rdi + rax * 4], ecx		; write 32-bit data
+	shr			ecx, 1						; shift low bit (oddness) into carry flag
+	adc			eax, 0						; having carry set increments write index by one
+	add			rsi, 1						; increments the (negative) read index towards zero (end of the data)
+	jl			.loop						; while the read index is still negative (sign flag set) keep looping
+
+this is 2 instructions shorter meaning that the loop can (on 12th gen and above) execute at 1 data item per clock cycle. (data write is 2 µops, add;jl fuses into one µop)
+the looping is as efficient as it can be: having a negative read index allows zero-crossing to act as the end of the loop while still counting in a positive direction, so there's no additional incrementing of read index while decrementing a loopcounter, or repeated comparisons to do to exit the loop.
+
+another way to achieve the same thing could be to use the and result directly:
+
+.loop:
+	mov			ecx, [rdx + rsi * 4]		; read 32-bit data
+	mov			[rdi + rax * 4], ecx		; write 32-bit data
+	and			ecx, 1						; keep only low bit (oddness)
+	add			eax, ecx					; oddness increments write index by one
+	add			rsi, 1						; increments the (negative) read index towards zero (end of the data)
+	jl			.loop						; while the read index is still negative (sign flag set) keep looping
+
+this has the advantage in that the increment-if-odd instruction pair isn't limited to certain execution ports that the add;js looping pair is also limited to.
+
+the second version loop could be modified to keep the even numbers instead by changing one instruction:
+
+.loop:
+	mov			ecx, [rdx + rsi * 4]		; read 32-bit data
+	mov			[rdi + rax * 4], ecx		; write 32-bit data
+	shr			ecx, 1						; shift low bit (oddness) into carry flag
+	sbb			eax, -1			; having carry set subtracts an extra 1 from an operation which is subtracting -1 (adds 1) thereby cancelling the increment
+	add			rsi, 1						; increments the (negative) read index towards zero (end of the data)
+	jl			.loop						; while the read index is still negative (sign flag set) keep looping
+
+and this (keep even) can be modified in a simmilar way to the second to get the same advantage, albeit at the cost of an extra register because andn cannot take an immediate value:
+
+	mov			r8d, 1
+.loop:
+	mov			ecx, [rdx + rsi * 4]		; read 32-bit data
+	mov			[rdi + rax * 4], ecx		; write 32-bit data
+	andn		ecx, ecx, r8d				; invert register and and with 1
+	add			eax, ecx					; evenness increments the write index
+	add			rsi, 1						; increments the (negative) read index towards zero (end of the data)
+	jl			.loop						; while the read index is still negative (sign flag set) keep looping
+
+
+you may notice that I've elected to use add with an immediate 1 in the loop incrementing instruction rather than the inc instruction which would seem to be made for the job: there is a reason for this. inc doesn't set all flags, this means that it's flags output must be merged with previous flags states, creating a false dependency on the prior flag-setting add instruction. since that instruction is itself dependent on the value set by andn and thereby on the data being read, and due to the add being fused with the js instruction that depends on flags, it would delay incrementing the read index waiting for the data to arrive, rather than doing the increment and allowing the next data read to be started immediately as it should. I will talk more on this kind of optimisation later, once we have covered the basics.
+
+Immediate operands, like the 1's, 0's and -1's above are little bits of data encoded directly into the instruction stream and are used for algorithmically constant numbers. 1, 2 and 4-byte immediate values can be encoded for most instructions, and the value will be sign-extended to the width of the registers or memory used as the destination of the instruction. The assembler will choose the best size for the immediate based on its value and the registers used. this will mostly be either 1 or 4-byte encoding since 2-byte encoding requires extra clock cycles to decode in the CPU. 8-byte immediates can only be encoded for a mov instruction, to place it in a 64-bit register for use by another instruction: they are rarely needed.
+
+Programs can also include initial and constant data elsewhere in the compiled file. In nasm/linux this is done by using the .data section:
+
+global	foo
+global	bar
+
+default rel										; this line tells the assembler to default to using PC-relative addressing. 
+												; the default default is absolute addressing, which makes it impossible to link the code produced into a
+												; normal, position-independent, executable file.
+section .data
+align 16										; tells the assebler and linker to put this data at a 16-byte aligned address
+array:		dd		1,5,9,11,13,22,25,87		; declair 8 32-bit values (dd = data, dword) label is "array"
+qwarray:	dq		0xffe3ffe4fedc9, 0xf0f0f0f0f0f0f0f0, 0x1111111111111111, 0xcccccccccccccccc
+												; declair 4 quadword values (dq = data, qword). label is qwarray
+
+section .text
+align 16										; tells the assembler and linker to put this code at a 16-byte aligned address
+foo:
+	mov		eax, [array + rdi * 4]				; reads 32-bit array element indexed by first parameter to the function
+	ret
+bar:
+	mov		rax, [qwarray + rdi * 8]			; reads 64-bit data element from qwarray, indexed by first parameter to the function
+	ret
+
+There is one more section that can be defined in an assembly language file: 
+
+section .bss
+
+this section is a directive to the operating system to pre-alocate some memory when loading the executable to run, in a specific address range relative to the code so it can be accessed in the same way as .data memory. It is read-write, but uninitialised, and takes up no space in the executable file, but will be there when the program runs. You cannot specify actual data to appear in .bss, but you can set labels and reserve space using res.. pseudoinstructions. eg
+
+section .bss
+align 16
+memory:		resd		4096			; reserve space for 4096 32-bit values starting at [memory]
+moremem:	resb		131072			; reserve 128KB at [moremem]
+
+Finally I will state what has probably become obvious already from the instructions: the format of an assembly language line.
+Every line can have some combination of the following: ({} curly braces indicate optional parts}
+
+{		}{label}{:}{		}{instruction {operands}}{		}{; comment}
+
+Nasm is very free with it's requirements on formatting, there can be whitespace before a label and none before an instruction, the colon after a label is optional, but it is a VERY good idea to keep to the stricter ruleset of other assemblers, simply for readability, at least in the beginning:
+
+{label:}		{instruction {operands}}{		}{; comment}
+
+the label has to be at the beginning of the line and have a colon, the instruction must have whitespace before it.
+
+Starting a label with a dot (.label:) indicates it as a local label, and the label actually defined includes the previous non-local label before the dot as part of its definition. within the same local section you can refer to the label with just the dot (jz .label) and the non-local label part will be added, but if you've defined another non-local label in the meantime then the wrong non-local part will be added, so you can also specify the whole thing if you like. (jz funcname.label)
+
+So now we've covered the absolute basics: memory/stack access, registers, looping and branching... it's time to start looking at the truly vast array of colours that x86_64 has on offer for us to paint our assembly language work of art with: instructions.
+
+And the array of instructions is daunting to say the least, so it's best to take it easy and start with just a basic beginners-set of colors. You can still do everything with just these 40 instructions, just as you can mix all colours from a basic palette, it'll just be quite slow relative to code that uses all the specialist operations that have come to exist due to the needs of programmers and software over the decades that x86 has been the king of computers. I strongly recommend downloading a copy of the intel sdm (software developer manual) and looking up these instructions to understand exactly what they will do, and all the operand options for each of them:
+
+instruction list 1: BASIC ESSENTIAL INSTRUCTIONS:
+
+:arithmetic ops:
+	adc		add two numbers. if carry flag is set, add an extra 1.
+	add		add two numbers
+	sbb		subtract second number from first. if carry is set, subtract an extra 1 (borrow)
+	sub		subtract second number from first. it should be noted that sub, sbb, and cmp use the carry flag to indicate that the second operand was larger than the 
+				first before the operation, and that a borrow was left from the top bit, although addition of a negated second operand is used to do the calculation 
+				and this would not generate a carry in this case. because it is a subtraction, the carry output is effectively inverted.
+	inc		add 1 to 
+	dec		subtract 1 from
+	div		divide two numbers in rax/rdx, give result and remainder in rax/rdx
+	idiv	divide two numbers with more register/memory options
+	imul	multiply two numbers with more register/memory options
+	mul		multiply two numbers in rax/rdx, give 128-bit result in rax/rdx
+	neg		negate (subtract from 0)
+
+:logic ops:
+	and		bitwise logical and
+	not		bitwise invert
+	or		bitwise logical or
+	rol/ror	rotate bits left/right, last bit rotated round goes into the carry flag.
+	sal/sar	arithmetic (sign respecting) shift left/right. last bit shifted out goes into carry flag.
+	shl/shr	logical (unsigned) shift left/right. last bit shifted out goes into carry flag.
+	xor		bitwise logical xor
+
+:flags input ops:
+	cmov(cc) perform a move if condition is met
+	set(cc)	set/clear one bit of byte register if condition is/is not met
+
+:flags only output ops:
+	cmp		perform a subtraction but throw away the result, keeping only flag state affect
+	test	perform a logical AND but throw away the result, keeping only flag state effect
+
+:control flow ops:
+	j(cc)	jump to label if condition is met
+	jmp		jump to label or indirect code address
+	call	call to label or indirect code address
+	ret		return from call
+	syscall	call the operating system for some service
+	nop		no operation (takes up space in the program memory but does nothing to registers or memory, sometimes used for code alignment)
+
+:memory ops:
+	lea		perform address calculation and place result in register
+	mov		copy data
+	movsx	copy data with sign extension to larger size
+	movzx	copy data with zero extension to larger size
+	pop		pop data from the stack
+	push	push data to the stack
+
+
+2: LESS BASIC INSTRUCTIONS:
+	andn	invert second operand, bitwise logical and with third and store in first
+	sarx/shlx/shrx		shift second operand by value stored in third operand and store result in first operand. does not set flags.
+	rorx	rotate second operand by value stored in third operand and store result in first operand. does not set flags.
+	mulx	multiply second and third operands and store low half of result in first. does not set flags.
+	rcl/rcr rotate-through-carry: performs a rotation on the register+1 bit, that is sourced and returned to the carry flag
+
+
+
+When writing any program, a basic given is that the operations you specify are performed in the sequence that you specify - but the point of writing in assembler is to get faster results than simply compiling C, C++ or any other compiled language. In order to get that faster result you have to know more about how a CPU goes faster than one instruction per clock cycle: the minimum quantum of time inside the CPU. The way they manage to process many instructions simultaneously is that the CPU is only pretending to do everything in the order you've specified. This is called Out-Of-Order Execution (OoOE). On top of this, and perhaps before this even, there was, and still is, the push for ever higher clock speeds as well, pushing CPU designers to split the processes into smaller and smaller parts that the instructions can flow through like cars on a section of road: more than one car is travelling the road at once, but not the same bit at the same time, and travelling it takes many times longer than the distance between the cars. This is called Pipelining, and gets applied to both the CPU as a whole and the processing of the more complex instructions, and we can benefit from thinking about our code in a pipelined fashion as well in order to get the most out of our CPU.
+
+OoOE allows any instruction within the execution window that has all its inputs available and an execution port to run on to execute. But what about branches? if a decision hasn't been made yet about which code to run, what about all those instructions that can't be even entered into the execution window yet? the answer is Branch Prediction, which basicall means that the CPU takes and educated guess at which way the branch will go. And sometimes it get it wrong, and so all the instructions that had been entered into the execution engine, and some that had already been executed too, have to be wiped away and their effects undone, returning the CPU to the state that is was when the wrong guess was made, and remembering the error to inform future guesses. All this takes time, a LOT of time, 20 cycles in fact, which is time enough for the execution of >100 instructions, so it is best to avoid doing so. Branching is unavoidable, but it is possible to make ones branches sufficiently predictable that the branch predictor almost allways gets it right (>99.99%) when you're dealing with large enough data sets (and that's when the speed of asm really counts). The way to do this is to avoid using conditional branches on anything that is sourced from the data being worked on - data dependent branches will allways be unpredictable unless the data is pre-sorted, but that's even more expensive usually. So how do we make decisions of what to do based on data if we can't branch? The answer is to break down our process into sections that can be summarised as: read data, process data, filter and store what we want to keep working on. The filterOdd function above is already an example of doing this: we read the data, and because stores cannot be conditional we always write the data to the shortened list, but then we process the data to see if we want to keep it, and only increment the write index if we do - otherwise the next data is written over the unwanted one. This is called branchless programming.
+
+That short loop is also an example of code pipelining. Each individual instruction in the sequence is dependent on one before, all going back to the initial data read, EXCEPT the increment for the data read index, which is only dependent on itself. This allows the read addresses for the next 10 iterations of the loop to be calculated in 10 cycles, and each read set in motion, with all the following instructions trailing after, and the writes waiting for the previous loop-cycle to finish deciding what the next write index will be. In this way, combining the OoOE with pipelineable code, all the execution units can be kept busy on all clock cycles, with data and code flowing through at maximum speed while the looping branch will keep racing ahead generating read addresses until it reaches the end of the data and we get one branch missprediction when it breaks out of the loop.
+
+it can be instructive and useful to analyse code you've written using a latency chart to determine how it will function. I personally do this with a piece of squared paper and a table that has the latency, throughput, and execution ports of the instructions I've used. I write the instruction sequence down the side, then starting close to the first instruction make a little line representing the time it takes to complete (the latency of the instruction). for each instruction I check where it's inputs are coming from in the above instructions, and start it's latency line vertically aligned with where the last one of it's inputs ends, taking account of the maximums allowed and it's possible port assignments (on my 11th gen cpu I can have 5 instructions total start on each vertical, and there's port space for 2 reads, 2 writes, and/or 4 computational instructions, although additional limitations apply to some of the less general purpose instructions). Analysing in this way will show up any bottlenecks, dependency chains, and show me what my expected throughput can be. After some time doing full analysis in that way you may find you can reduce the amount of analysis to just counting the ports, because you know that you've not done anything that is loop dependent to slow it down. Analysis of this kind can be helpful in working out how bad a specific loop latency is, in cases where loop dependency is algorithmically unavoidable, such as list traversal or iterative mathematical computations (...maybe if I can get This value that is needed by the next iteration early, and leave That one needed by the next iteration later, I can get the iterations to overlap half-way...), and help to determine which of several options is the least bad.
+
+And there should be several options. When optimising, keep rewriting and re-analyzing the code to find the way. I like to use a simple tree-summing process as an example of how recursion is a bad way to scan through all elements of a binary tree, but even if it's bad I want to write it the best I can so it's not just an example of lazy coding! I went through 5 stages of increasing optimisation that although the end result is still more than twice the time per element as the data-streaming version, and still isn't vectorisable in any way, has no data determined branches, only stores not-taken valid tree-branches, and is barely worse than a list-traversal in operation. With no call's or returns other than the function return, can you even still call it recursive? You can follow the full journey in >THIS< video, if you're interested.
+
+
+
+
+
+
+

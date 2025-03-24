@@ -1,0 +1,83 @@
+;struct node {
+;	node* left;
+;	node* right;
+;	int val;
+;	int nchildren;
+;}
+;
+;int treesum(node* n)
+;{
+;	if(!n) return 0;
+;	return n->val + treesum(n->left) + treesum(n->right);
+;}
+
+;	expects node* root in rdi.
+; using rax as summing accumulate passed in and out of recursive calls
+
+return:
+	ret
+treesum:
+	xor		eax, eax		; eax is only cleared by the external call
+.internal:					; internally, eax is passed in and out of
+	test	rdi, rdi		; all the calls
+	jz		return			; << this makes it slow
+	
+	add		eax, [rdi + 16]	; eax remains, passed through everything 
+	mov		rsi, [rdi + 8]	; push the right pointer for later
+	push	rsi
+	mov		rdi, [rdi]		; get left pointer
+	call	.internal		; make the recursive call,
+	pop		rdi				; then get right back from the stack
+							; we dont need to retrieve anything after the
+	jmp		.internal		; second call - which can be replaced with a
+							; jump for tail recursion 
+
+;************** V2 ***************
+
+;	expects node* root in rdi.
+
+return:
+	ret
+treesum:
+	xor		eax, eax		; eax is only cleared by the external call
+.internal:					; internally, eax is passed in and out of
+	test	rdi, rdi		; all the calls
+	jz		return			; << this makes it slow, because it is data
+							; dependent, and therefore not predictable.
+							; at half+1 of the left/right pointers will
+							; be zero, but the sequence that we arrive
+							; at them is kinda random, so if the cpu
+							; always predicts not taken (the better option)
+							; it will be wrong half of the time. 
+							; average penalty 10c/iteration
+	
+	add		eax, [rdi + 16]	; eax accumulates throughout
+	
+	mov		rsi, [rdi + 8]	; read and keep our right node* on the stack
+	push	rsi				; for the second call, so we don't have to
+							; revisit a node
+
+							; the next line also makes it slow, since the
+							; full memory request-to-use latency is inside
+							; the loop. we cannot start address calculation
+							; until the result of the previous read comes in.
+	mov		rdi, [rdi]		; we dont need our own node* again after the
+	call	.internal		; call
+
+	pop		rdi				; get the right node* back from the stack
+	jmp		.internal		; second call replaced with a
+							; jump for tail recursion 
+
+; the stack engine takes care of the implicit push and pop of a call/ret
+; but the push/pop/mov,[] of rdi creates a latency chain which includes
+; memory reads that must complete before the address of the next read can
+; be calculated... and the data dependent branch will likely misspredict
+; about 50% of the time...
+
+; it can never reliably read ahead, and cannot know where it will be reading
+; from, so it cannot queue up reads, and must always wait for them to complete
+; and frequently back up when the branch is inevitably predicted incorrectly.
+
+; in short, this code, though elegent, cannot flow through the CPU, and will
+; on average take about 15cycles per node.
+

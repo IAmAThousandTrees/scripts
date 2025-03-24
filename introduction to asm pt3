@@ -1,0 +1,216 @@
+so we have covered the basics of vector processing, taking data from well-organised streams of input, doing basic calculations on them, and writing the results to simmilarly well organised streams of output. This is enough for most DSP-type applications but there are many times when the data is not well organised, or is well organised for one part of the operation but not for another. This is where all the various element reorganising instructions come in. in general there are 3 basic types: shuffles, permutes, and unpacking operations. shuffles and permutes are quite simmilar, differing only in that shuffles happen within 128-bit lanes within the registers, dividing bigger registers into sections, whereas permutes allow moving data accross lanes as well as within them, in some cases sourcing data from 2 input tables for more options. unpacking operations are also within a lane but do a specific move, interleaving elements from 2 input registers either from the low half or from the high half of the lane.
+
+One fairly common rearrangement that is required is to take data that is contiguous in memory and rearrange so that it is striped down columns in registers, so that a series of operations can be applied to the series of data, but acting on multiple streams at once in a simmilar way. One way to do this is to use a gather operation, but this forces the memory reads to happen 32 or 64-bits at a time, which is much slower than reading the contiguous data. It may be more efficient to read the data streams into vector registers and then rearrange to be vertical and the most efficient method I've managed for this uses unpack operations and one extra register.
+
+Assuming 32-bit data, and 256-bit registers, the simpler form is to load 128 bit sections of the streams into 4 registers such that the elements contain items 0,1,2,3 from streams A,B,C,D,E,F,G,H like this (written in monolithic little-endian register form, least significant element on the right):
+
+										;ymm1:	E3.E2.E1.E0:A3.A2.A1.A0
+										;ymm2:	F3.F2.F1.F0:B3.B2.B1.B0
+										;ymm3:	G3.G2.G1.G0:C3.C2.C1.C0
+										;ymm4:	H3.H2.H1.H0:D3.D2.D1.D0
+
+	vunpcklps	ymm0, ymm1, ymm3		;ymm0:	G1.E1.G0.E0:C1.A1.C0.A0
+	vunpckhps	ymm1, ymm1, ymm3		;ymm1:	G3.E3.G2.E2:C3.A3.C2.A2
+	vunpckhps	ymm3, ymm2, ymm4		;ymm3:	H3.F3.H2.F2:D3.B3.D2.B2
+	vunpcklps	ymm2, ymm2, ymm4		;ymm2:	H1.F1.H0.F0:D1.B1.D0.B0
+	vunpckhps	ymm4, ymm1, ymm3		;ymm4:	H3.G3.F3.E3:D3.C3.B3.A3
+	vunpcklps	ymm3, ymm1, ymm3		;ymm3:	H2.G2.F2.E2:D2.C2.B2.A2
+	vunpcklps	ymm1, ymm0, ymm2		;ymm1:	H0.G0.F0.E0:D0.C0.B0.A0
+	vunpckhps	ymm2, ymm0, ymm2		;ymm2:	H1.G1.F1.E1:D1.C1.B1.A1
+
+reversing to write back to the original streams after a series of operations done this way round is done using the exact same sequence of unpack operations. Since it is effectively a diagonal flip (matrix transpose) of the 4x4 squares of data in each lane, flipping them again returns everything to its original shape, and although AVX2 has a gather operation, it lacks a scatter to put the data back how it was at the end, and even if you have both those operations it can still be quicker this way.
+
+if we calculate the total µops on each port for each method (256-bit registers):
+
+				unpack				gather/scatter
+p015			4					24				; gather issues 2 vector arithmetic ops, scatter issues 4. 4 rows gathered and scattered...
+p5				16					0				; unpack and insert ops on upper half reads are all on port 5
+p23				8					8
+p49				8					32
+p78				8					32
+
+total:			44					96→→→→→→ at 5 µops/cycle issue rate this takes 19.2 cycles of blocking fp instructions as well ... or ...
+				 →→→→→→→→ whereas these 44 ops can complete in 16 cycles with space for 28 256bit math ops on ports 0&1 at the same time
+
+It takes at least 64 math ops in the loop to take long enough to spread out all the memory ops of the gather and scatter to take the same time and mitigate the difference between the two methods, not to mention that the unpack method also works on instruction sets back to SSE1 and gather didn't apear til avx2, scatter till avx512...
+
+before I start to stray any further from avx2 territory into avx512-land I'll make good on my promise from before to talk about abusing the floating-point convertion operations, a little trick to do exponential functions on vectors, with decent accuracy over a wide range of inputs. It goes like this:
+if you multiply a float X by (float)1<<23, then convert that result to integer, and finally add (uint)127<<23, you get a very crude approximation of 2.0^X. crude as in a straight line from each whole increment of X to the next. You can improve this approximation a great deal by separating the integer part of X from the fraction, and doing a taylor series expansion of a few terms. Since taylor series is much more accurate close to zero, using the range from -0.5 to 0.5 is best, generated using rounding (with a rounding op) and subtracting. This will change the slope between the whole number increments of X without changing when they occur, so when you do the convert-to-int trick and recombine with the integer part <<23, the result will be a very close approximation of the function you want. With careful arrangement of the constants and fma ops it can be done in about 11 µops per vector of data. iirc just three terms of the taylor series without adjustment can result in 22-bit accuracy on floats, and 6 terms gets to 50-bit accuracy on doubles (16 µops). 
+
+; float data in ymm0
+	vroundps		ymm1, ymm0, 0		; round to nearest integer
+	vsubps			ymm0, ymm0, ymm1	; ymm0 is now just the fraction, -0.5 to 0.5
+	vcvtps2dq		ymm1, ymm1			; integer part as integer
+	vpslld			ymm1, ymm1, 23		; integer part in exponent position
+	vmulps			ymm0, ymm0, ymm15	; ymm15 = 0.693147 (ln(2)) *1<<23. scales so that the taylor expansion for e^x gives 2^x
+	vmulps			ymm2, ymm0, ymm0	; x²
+	vmulps			ymm3, ymm2, ymm0	; x³
+	vfmadd231ps		ymm0, ymm2, ymm14	; ymm14 = 1/(2<<23)
+	vfmadd231ps		ymm0, ymm3, ymm13	; ymm13 = 1/(6<<46)
+	vpaddd			ymm0, ymm1			; but we missed out the first 1 in the taylor series!? a float has an implicit 1 that gets added when we treat our
+	vcvtps2dq		ymm0, ymm0
+
+************************* TODO: remember how this is supposed to work!
+
+
+
+
+So now we're going to start straying beyond AVX2 into the advanced vector facilities that AVX512 introduces, that combine to make the vectorising of almost anything (at least, much more than before...) if you are willing to take a fresh look at how things are done, how data and processes are arranged, both in data and in code. Fortunately the shift in mentality is the same one that is required for writing pipelineable code that we discussed in >part 1<, so the tecniques work very well together. It almost makes one think that having some of the brightest silicon design minds on the planet looking at the intractible problems of ever increasing compute density and speed, combined with industry feedback from a massive installed base of supercomputing hardware gives them some insight on the direction that hardware and software design need to head in order to keep progressing...
+
+Before going further some terminology relating to vector registers needs to be clarified. When I refer to an "element" I mean a single value (byte, word, dword or qword) in a single register. "Column" means same-positioned elements that will interract with each other across multiple registers. Lane is an intel-architecture term to describe the 128-bit-wide chunks of register that their instructions prefer to work within. xmmreg is a single lane, ymmreg's have 2 lanes, zmmreg's have 4. Operations that move data within a lane tends to take 1 cycle, but between lanes takes 3. In recent architectures the in-lane shuffles have an extra execution port, but the cross-lane permutes do not. Registers are registers, but sometimes I will differentiate the purpose of the register in context by calling it either a table (contains data to be selected from) or an index (contains data that will do the selecting), in line with Intel's own terminology in the sdm.
+
+Shuffles and permutes rearrange data elements from one register to another. They've been around since SSEv1 in their most basic form where they take an immediate operand that chooses which elements come from where, useful for some particular part of a mathematical process that requires a fixed reordering of the data, like in fft twiddles. But something interesting happens in the later versions of avx where permutes can be determined on the fly from indexes in another register: They become lookup tables. That require no memory access. And can do a lookup of 16 dwords, 32 words, or 64 bytes simultaneously, from double that number of simmilar sized entries. In a single µop.
+
+And lookup tables are useful, they can do a great many things. From logic to math, you have a number that means something and needs to be replaced with something else? permute. You want to convert letter values to arbitrarily ordered bits? Permute. You want to grab a set of array indexes suitable for scattering a table of data elements? Permute. As long as the lookup data fits into 2 registers you can permute (technically you can combine results from multiple permutes to select from more than 2 registers, but that becomes cumbersome and slow, so it better be infrequent and worth it).
+
+; example 1: arbitrary byte value filtering by permute. data in zmm0
+	vpsrlq		zmm2, zmm0, 3				; first three bits not needed for the permute, their role is in the shuffle
+	vpermb		zmm2, zmm2, zmm21			; zmm21 has the truth table for which byte values shall pass and which fail, as a 256-bit field repeated twice.
+	vpshufb		zmm1, zmm0, zmm20			; zmm20 has 0x8040201008040201 repeated accross it. the result is as if a byte-wide variable left-rotate of 0x010101...
+	vptestmb	k1, zmm1, zmm2				; pass/fail is now in the K-register for transfer to result bitfield or use in compress etc.
+
+Permutes can be aggregated, quite simply. If you have a series of permutes and shuffles with nothing in between, including mixed element sizes, simply put an identity table (0,1,2,3...) of the smallest element size in the sequence, and put that id.table through the series of permutes. what comes out the other end will be a permute index table, for a single permute of the smallest element size, that incorperates all the moves of the whole set.
+
+The vpmultishiftqb instruction selects arbitrary 8-bit chunks from the source data qword, defined by the bytes in the index qword. each byte selects the starting bit of the block it will copy, and if it selects too near the end (>56th bit) then the rest of its 8 bits will be sourced from the beginning. 
+
+vpternlog is a true swiss-army-knife instruction. ternlog takes 3 inputs (one is overwritten) and combines them using an 8-bit immediate as a lookup truth-table with the each of the three inputs providing one bit of the value looked up. Every possible 3-input (and 2-input, and 1-input, and 0-input) logic network can be represented by those 8 bits. things I've used it for include: bit-granular blending (third register chooses which of the other two get represented), combining multiple ands and ors into less instructions, specific bit sequence finding between registers... there is a 16x16 table of all the logic functions, but this actually overcomplicates the use of the instruction. just write out the truth table of the logic you want and turn that into the byte immediate:
+
+			immediate bit:	7	6	5	4	3	2	1	0
+			
+				input	A:	1	1	1	1	0	0	0	0
+				input	B:	1	1	0	0	1	1	0	0
+				input	C:	1	0	1	0	1	0	1	0
+							-	-	-	-	-	-	-	-
+		example	1:	orABC	1	1	1	1	1	1	1	0		0xfe
+				2:	andABC	1	0	0	0	0	0	0	0		0x80
+				3:	C?B:A	1	1	0	1	1	0	0	0		0xd8
+				4:	101=1	0	1	0	0	0	0	0	0		0x40
+				5:	xnorBC	1	0	0	1	1	0	0	1		0x99	(note: any immediate that has the same hex digit twice ignores A, the destination)
+				6:	true	1	1	1	1	1	1	1	1		0xff	(sometimes you just want a register full of 1s without having to load it from memory)
+				7:	B?C:A	1	0	1	1	1	0	0	0		0xb8
+				8:	norABC	0	0	0	0	0	0	0	1		0x01
+
+vector double-shifts (vpshrdd etc.) are the vector version of the scalar double shift and they achieve the same result, infinite width shift fields, only quicker. Start by reading the data in its normal alignment and then again one element accross in the direction you want to shift in from, then double-shift using those two registers. This gets around the limitation of only being able to shift or rotate vector registers within their elements. Obviously being able to shift data in from another register has other uses as well... the only limit is your imagination ;þ
+
+closely related to double-shifts, and available in some form since very early in the development of vector instructions but still worthy of mention are the align instructions: valignd, valignq, and vpalignr. They do almost exactly what the double-shifts do but with the entire register (or a 128-bit section in the case of vpalignr), although they don't give bit level granularity but qword, dword or byte. between them it's possible to rotate a register to any byte-position in 2 instructions, or create a complete set of rotations for 1 instruction each. They only take an immediate byte operand to control the amount of shift, and they only shift right, but you can freely choose which way round the input elements are so you can get the effect of a left shift for the cost of a little mental arithmetic :)
+
+vpcompress is likely the single most important instruction in the vector toolset, simply because it permits the same kind of pipelineable data-streaming processes that I showed earlier to be very effective at keeping the CPU working at it's maximum throughput. vpcompress allows data to be filteres and the results made contiguous when written back to memory, with no gaps, so the next process to work on the data has all elements filled in its tables when it picks the data back up. This is the most effective way to work with data tha has a series of filters it must pass at different stages. The same pattern of read all data, process till decision, then discard data that's not going on to the next step that we looked at before can be done with the compress operations. Here is the vector version of that trivial filterOdd() function from part1:
+
+
+;; the C pattern:
+;; int filterOdd(int *data, int n_data); // remove all non-odd elements from an array, returns new length
+
+filterOdd:
+	lea			rdx, [rdi + rsi * 4]		; pointer to one-past-the-end of the input array in rdx
+	neg			rsi							; 64-bit negative of the array length so when they're added again the result is the start of the array
+	xor			eax, eax					; clear eax to take the index of where the filtered data is getting written to, which will also be the return value
+.loop:
+	vmovdqu32	zmm0, [rdx + rsi * 4]		; read 512-bits of 32-bit data
+	add			rsi, 16						; increments the (negative) read index towards zero (end of the data)
+	jns			.lastfew					; while the read index is still negative (sign flag set) keep looping
+	vptestmd	k1, zmm0, zmm20				; zmm21 has 1s as dwords, k1 gets the info of which elements are odd
+	vpcompressd	[rdi + rax * 4]{k1}, zmm0	; write odd element selections back to the array
+	kmovw		ecx, k1						; transfer selection mask to gprs
+	popcnt		ecx, ecx					; count how many valid entries were added
+	add			eax, ecx					; increment writeback index by that count
+	jmp			.loop						; vpcompressd is the limiting factor in this loop since it has a throughput of 1 per 3 cycles
+											; 	but that's still >5 data items per clock cycle on average, 6x faster than the scalar GPR version.
+											;	and still with 4 excution slots free for more complex decision-making logic before it starts to slow down
+											;	1p23 1p49 1p78 3p5 1p0 1p1 2p06 1p0156 total:11µops 3p5 is limit
+.lastfew:
+	mov			ecx, 0xffff
+	shrx		ecx, ecx, esi				; when esi goes positive and we break out of the loop, the value indicates the overread
+	kmovw		k1, ecx						; using this value we create a mask that tells the vector instructions which data to ignore
+	vptestmd	k1{k1}, zmm0, zmm20			; zmm21 has 1s as dwords, k1 gets the info of which elements are odd. applying a mask to a mask is basically an and op.
+	vpcompressd	[rdi + rax * 4]{k1}, zmm0	; write odd element selections back to the array
+	kmovw		ecx, k1						; transfer selection mask to gprs
+	popcnt		ecx, ecx					; count how many valid entries were added
+	add			eax, ecx					; increment writeback index by that count
+	ret										; the return value is already in eax, no registers that the caller expects to be there have been overwritten,
+											; so there's nothing else to do and we can just return.
+
+as before, the read index has a constant increment applied so that the indexes can be calulated early and the read ops got under way. The increment is done early, though as late as possible. Usually you'd be able to do a bunch of processing that doesn't care about junk data coming along for the ride on the final loop before breaking out at the point when the decisions about which data to treat seriously and write out start happening, but this trivial example doen't have anything to do before making the decisions so the encrement and branch-out come right after the read-in. This method assumes that the memory immediately above the data up to the next 64-byte increment is also readable without causing a segfault, which you can decide is going to be true by how you allocate the memory for it. As mentioned in the notes, the final increment sends the index non-negative and by how much will be the exact number of elements that have junk data. making a mask for the junk data is a matter of getting 16 1s and shifting away the overread count.
+
+compress has its counterpart, expand, but I have yet to find a compelling reason to introduce space into a table or memory array, I always want every element filled and doing work, thankyou! But I suppose an opposite approach to using memory to contain a shrinking list of work that requires more work would be to use expand to replace completed elements as needed from the supply of remaining work. This has, in my mind, the problematic flaw of being a data-dependent read index increment, which requires each cycle's processing to complete before the next cycles read can even be started. Although it's possible to do the replacement read at the end of each cycle, it still has to complete before the next cycle's work can begin, preventing pipelineing/OoOE of the loop, and making total process latency very important when it doesn't need to be.
+
+I haven't spoken yet about the k-mask registers that control the element selections in compress and expand, so I will do now. All avx512 instructions (all instruction versions that access zmmregs, and evex-encoded versions of instructions working on smaller registers) have a write-mask applied. Some make specific use of the mask in different ways like compress does, but for most it just acts to filter which elements get updated and which not. There are 8 K-mask registers numbered k0 to k7, but the contents of k0 are not used for masking. Not declairing a mask on an instruction actually sets the mask used to k0, and k0 means "keep all results". As well as the k-reg, you can also specify a {z}, this determines that the unselected elements will be zeroed rather than merged, and it breaks any dependency on the previous value of the register being written. The k-mask registers are 64-bits which is enough to mask down to the byte granularity, but the granularity of masking is always the same as the element size of the operation being masked, so dword/float operations only use the first 16 bits and qword/double operations only use the first 8. All kmask instructions have a data-width letter at the end (b,w,d,q), and all bits not included in that width are zeroed. k-masks are physically stored in the mmx register file, which affects how long they take to transfer to and from GPR's. Some operations (add, shift) are weirdly slow (4 cycles latency) but most logic ops are 1-cycle. The only issue is that they all happen on the same ports as the vector instructions they control (p0 or p5), taking execution slots that would otherwise go to vector instruction doing significant work, so their use should be kept to a minimum.
+
+I frequently find myself using kmasks to non-distructively combine data from 2 registers down into a single one, or to reverse the process, using byte permutes and a comb k-mask:
+
+; dword data in zmm0 and zmm1 but only occupies <16 bits (eg lzcnt/popcnt results or permutation indexes)
+	vpshufb		zmm0{k7}, zmm1, zmm20			; k7 has a 64-bit 2.2 comb mask 0xcccccccccccccccc,
+												; zmm20 has the shuffle index 2,3,0,1,6,7,4,5,10,11,8,9,14,15,12,13;2,3,0,1.... (b)(l2r)
+												; one op merges interleaved words from 2 registers
+
+
+scatter uses k-masks in a specific way: to report errors occurring while writing. Scatter ops split the data into its elements and use the indexes supplied in a second register to generate individual write addresses for each one. When writing it's possible for one of them to throw a memory error, and if so the instruction gets halted midway through writing. In case the data is important and you have a way to recover from the error, a writeable k-mask (not k0) with all bits set of elements wanting to be written must be supplied. as the writes complete, the bits are switched off, so that if successful you'll get back a null k-mask. If some error happened, though, you can try again resupplying the partially zeroed k-mask to the instruction to avoid rewriting already successfuly written elements. Scatters can take a long time, but most of their µops are on the p49p78 domains meaning that the vector alu ports are free to be getting on with working out where the next set of data shold be being scattered to. Scatter can be very useful for implementing on-the-fly sorting of work items into groups or piles, or implementing any kind of radix or bucket sort, but it has a major stumble: working out how to keep work items in the same vector that are destined for the same group or pile from overwriting each other. The biggest issue is that the instruction provided for this purpose vpconflictd/q takes so many µops to work out the result, that it keeps the vector ALU busy longer than the scatter keeps the memory system busy, chucking 37µops into the p05 domain, and taking 19.4 cycles to complete vs vpscatterdd having 36µops, mainly in the p49p78 domain, and taking 11cycles to complete... not to mentin that after all that, it still doesn't tell me the per-pile index increments that need to be done afterwards if I don't want to use memory to hold the indexes, and have to gather and rescatter them every time as well!
+
+So I had to find a better way. After all, the indexes are just a lookup table, and we know how to do that ridiculously quick with a permute, so we just need to work out how to work out the per work-item index increments to stop them stepping on each others toes (de-conflict) and also transfer the count back to the pile-lookup columns as well so everything can be incremented nice and cleanly without using memory for the index table... Thankfully I was already quite close to the answer when this cropped up. I'd been using a complex series of shifts and bitwise blends to transfer the bits from a dataset whos bits I had to count according to which position they were in in the bitmask... which is a very simmilar task to counting how many work-elements reference the same index entry. I just had to turn the selections into a bitmask and use the same bit matrix transposition sequence to tell the index columns who was choosing them. then, because the work items already know how to get the information from the index table columns, they can pull that data back and see who else is also selecting the same index column, mask it so that only those to the right are counted and voila! we have both sets of increments from a single sequence of instructions, and it even allows for deconflicting of larger numbers of elements than vpconflictd in a single process that has waaaay less µops on the p05 domain...
+
+I call this magical process a Bit Matrix Transpose, and it should be an instruction. Not because it deconflicts scatters, sorts elements and counts group memberships, or because it's exceedingly simple to implement being a fixed wiring of bits from input to output, but because it fills a hole in the vector instruction set: the ability to push information to other-column destinations. All other methods of moving data from column to column currently in the instruction set pull information into the column from somewhere else, but theres no way for a column to specify a destination column where it's data should be sent *to*. This fills that hole, permitting a whole lot of things that were hard before, like reversing a permutation matrix to send data back where it came from, or frankly any situation where you want to signal a specific column to take notice of whats going on in another one based on information only available in the source column. The operation is exceedingly simple, as I said, every output element gets one bit from every input element, with its position in each determining where it will go to and reflecting where it has come from. In Intels inimitable pseudocode that they describe all their instructions with it would look like this:
+
+x:=input_element_width:{8,16,32,64};
+y:=output_element_width:{8,16,32,64};
+ops:=x*y;						//operation size: 64 to 512 bits
+rep:=registerWidth/ops;			//repetitions across the register
+r:=0;
+DO WHILE r<rep
+	e:=0;						//input element, output bit
+	DO WHILE e<y
+		b:=0;					//input bit, output element
+		DO WHILE b<x
+			DEST[r*ops + b*y + e]:=SRC[r*ops + e*x + b];
+			b++;
+		OD
+		e++;
+	OD
+	r++;
+OD
+
+It unfolds into a family of operations with every pairing of input and output element width that doesn't exceed the register width when multiplied together, so 8x8,16x8,8x16,16x16,8x32,32x8,16x32,32x16,64x8 and 8x64. or bb,wb,bw,ww,bd,db,wd,dw,qb,bq, ten in total. It can also be useful to define an interleaved word→word operation where the lower 16 bits of each input dword are transposed into the lower 16 bits of each output dword and the upper 16 bits likewise, since this allows a 1-1 transfer of information from one dword table to another.
+
+But since it doesn't exist yet, I currently emulate the members of this instruction family with a series of 8 operations (fewer in some cases). The core 6 ops does the 8x8 bit matrix transpose on the 8 qwords of the register. Then before and after a byte permute and/or a byte shuffle rearrange the input data and output data into the right places to achieve the higher order operations. The core is a series of 3 vpmultishiftqb instructions interspersed with 3 vpternlog B?C:A (bitwise blend) operations, each with suitable bit index/blend masks for the process.
+
+The family members I make most use of are the 16x32 (wd) and 32x16 (dw) variants. This is the 16 dwords to 32 words process in asm:
+
+; code for vpbmtdw	zmm0, zmm0
+; input mask in zmm0
+	vpermb			zmm0, zmm20, zmm0		;zmm20 = 0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,1,5,9,13....51,55,59,63 (b)(l2r) 1st bytes together, 2nd bytes...
+	vpmultishiftqb	zmm1, zmm21, zmm0		;zmm21 = 0x1c140c04342c241c (x8)(qwords). ie swap halves but shift out from center 4 bits first
+	vpternlogd		zmm0, zmm22, zmm1, 0xb8	;B?C:A, zmm22 = 0x0f0f0f0ff0f0f0f0 (x8)(qwords). blend bits together
+	vpmultishiftqb	zmm1, zmm23, zmm0		;zmm23 = 0x2a22362e0a02160e (x8)(qwords). ie swap adjacent words but shift out from center of each pair 2 bits first
+	vpternlogd		zmm0, zmm24, zmm1, 0xb8	;B?C:A, zmm24 = 0x3333cccc3333cccc (x8)(qwords). blend bits together
+	vpmultishiftqb	zmm1, zmm25, zmm0		;zmm25 = 0x3137212711170107 (x8)(qwords). ie swap adjacent bytes but shift out from center of each pair 1 bit first
+	vpternlogd		zmm0, zmm26, zmm1, 0xb8	;B?C:A, zmm26 = 0x55aa55aa55aa55aa (x8)(qwords). blend bits together
+	vpshufb			zmm0, zmm27, zmm0		;zmm27 = 0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15; (x4)(b)(l2r)
+
+
+put a variable rotate in front to shift bits into column selection positions, then 2 permutes, 2 and-masks and 3 vpopcnt's below, and you have everything you need for happy scattering of 16 elements into 32 piles. Swap the first and last instructions with some adjustment of the indexes and you can throw 32 elements into 16 piles instead:
+
+; code for vpbmtwd	zmm0, zmm0
+	vpshufb			zmm0, zmm20, zmm0		;zmm20 = 0,2,4,6,8,10,12,14,1,3,5,7,9,11,13,15; (x4)(b)(l2r)
+	vpmultishiftqb	zmm1, zmm21, zmm0		;zmm21 = 0x1c140c04342c241c (x8)(qwords). ie swap halves but shift out from center 4 bits as well
+	vpternlogd		zmm0, zmm22, zmm1, 0xb8	;B?C:A, zmm22 = 0x0f0f0f0ff0f0f0f0 (x8)(qwords). blend bits together
+	vpmultishiftqb	zmm1, zmm23, zmm0		;zmm23 = 0x2a22362e0a02160e (x8)(qwords). ie swap adjacent words but shift out from center of each pair 2 bits as well
+	vpternlogd		zmm0, zmm24, zmm1, 0xb8	;B?C:A, zmm24 = 0x3333cccc3333cccc (x8)(qwords). blend bits together
+	vpmultishiftqb	zmm1, zmm25, zmm0		;zmm25 = 0x3137212711170107 (x8)(qwords). ie swap adjacent bytes but shift out from center of each pair 1 bit as well
+	vpternlogd		zmm0, zmm26, zmm1, 0xb8	;B?C:A, zmm26 = 0x55aa55aa55aa55aa (x8)(qwords). blend bits together
+	vpermb			zmm0, zmm27, zmm0		;zmm27 = 0,16,32,48,1,17,33,49,2,18,34,50....15,31,47,63 (b)(l2r)
+
+using the second block for our example, the first line rearranges bytes so that the low byte from each word are all in the first qword and the high byte is in the second qword of each 16-byte lane. the second & third lines combined replace the upper half of the first 4 bytes with the lower half of the second 4 bytes and the lower half of the second 4 bytes with the upper half of the first 4 bytes. the 4th & 5th lines repeat this at the dword/nybble level, swapping the upper half of each nybble of the lower half of the dword with the lower half of each nybble of the upper half of the dword. The 6th & 7th lines repeat this again with words and bit-pairs. this results in each byte of each lane containing the relevent bits from all 8 of the input words in that lane, which would be the end result for vpbmtwb, but then we use a byte permute to bring the byte=bit results from all the lanes together in dwords giving the vpbmtwd result we want. Each output column has one bit that's come from one of the input columns, and its position in the dword tells that column which input column it came from. 
+
+For several examples of using bit matrix transposes see >THIS< video... (avx512isawesome.txt) but a summary of uses I have found so far would be:
+- scatter deconflict		(generates a table of index increments for the index source tables and for the selected column scatter index table in just 6 µops)
+- per-bit data bit-counting	(can be used for the pre-radix-sort element counting, also for counting for multiple unrelated sort stages in a single pass)
+- reversing a permute table (with the same most-significant-element overwrite priority seen in scatter)
+- sort vector elements 		(use comparison ranking by rotation, then reverse permute based on the rankings - about half the time of a min-max-mergesort)
+- arbitrary bit reordering 	(→bbr, permute, ←bbr)
+- vector pdep (shared mask)	(→bbr, vpexpand, ←bbr)
+- vector pext (shared mask)	(→bbr, compress, ←bbr)
+
+This method has just 2 flaws. 1: it needs 8 zmmreg constants, (10 if you include the filter-mask for generating the de-conflicting increments afterwards and the rack of 1s for creating the selection mask beforehand) which either have to occupy 1/4 of the register file, which might be at a premium, or have to be reloaded from memory every time occupying read bandwidth, which might be at a premium, and occupying scheduler slots, which might be at a premium. 2: The other flaw is that the multishift instruction latency of 3c gives the whole process a latency of 16c - though if your loop is properly pipeline-friendly that shouldn't be a problem. 
+
+So I think I'll call it an episode here, we've clearly seen that avx512 can take vector processing far beyond the sales pitch of faster fp-compute into realms of high-efficiency vector data processing hitherto undreamt of. The big issue is really that all of this is still mostly only accessible to the tiniest fraction of progarammers who have the capacity (and time) to get down here into the assembly language engine-room of the data-crunching Enterprise. For me, at least, it seems far easier to develop these concepts and processes in assembler than in higher-level languages where at best one is encumbered by clunky compiler intrinsic functions and restrictive data types, and at worst completely prevented from comprehending the factors limiting your code's performance. LONG gone are the days of "the compiler will optimize better than you ever could", since most of these optimisations require a different way of thinking and changing how the results are generated and in what order is FAR beyond the remit of any languages compiler.
+
+I am in the process of librifying much of this knowledge into a set of higher-order functions and associated bulk, bitfield and vector data types to enable non-asm programmers to get some of the benefits of the newer hardware. Although some vector libraries exist, I've not seen anything approaching this level of development. But it is currently only in the conceptual phase, and may never happen, so for the time being, come down into the engine-room and get dirty! we have cake.
+

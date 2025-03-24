@@ -1,0 +1,272 @@
+[AVX512 + common selling points: fp perf, mem bandwidth, reg file size]
+
+AVX 512 is awesome, but not for any reason that a marketing manager can use to sell CPU's to a business exec or gamer, and not even for the benefits to the average programmer, because they mostly can't benefit from it ... yet. [crossing off selling points, replace with ?]
+
+AVX 512 is awesome because of what it makes possible: the vectorisation and consequent 10x speedup of almost any bulk data process (and by bulk I mean anything more than a few thousand items)... and many things that at first don't look like bulk data processes can be converted into bulk data processes if you can think about them in the right way, using the tools that avx512 provides. [add images of text process, sorting, hashing, combinatorial search, ??] 
+
+Core among those tools are the ability to rapidly rearrange data into and from vectors, and select elements to affect within a vector: compress, expand, scatter, permutes for every size of element, and k-masks. Nearly as important are ternery logic, multishifts, double-shifts (like the gpr double-shift but for vector elements), integeral broadcasts, and a great many other factors that make many things that previously were not, be efficiently and effectively vectorisable. [depict gather, scatter, compress, expand, permute, ternlog, multishift, double-shift, broadcast]
+
+But first your code must flow, and from that flow can come vectorisation.
+
+As a simple example of what I mean, lets look at a simple tree structure summing algorithm in C:
+
+[onscreen:
+	struct node {
+		node* left;
+		node* right;
+		int val;
+		int nchildren;
+	}
+	
+	int treesum(node* n)
+	{
+		if(!n) return 0;
+		return n->val + treesum(n->left) + treesum(n->right);
+	}
+]
+
+this is elegant and easy to understand, and does the job, but it is terrible for flow of both code and data, and intrinsically unvectorisable.
+
+It has that cardinal sin, a data-dependent (and therefore unpredictable) branch, as line 1, followed by calls that then make all future execution wait for data to be fetched ensuring that any attempts the cpu makes at keeping its execution units busy are thwarted. [highlight code lines as spoken of]
+
+if we take a closer look at what the cpu is actually asked to do:
+
+[onscreen: show inline comments only while discussing the line
+
+;	expects node* root in rdi.
+
+return:
+	ret
+treesum:
+	xor		eax, eax		; eax is only cleared by the external call
+.internal:					; internally, eax is passed in and out of
+	test	rdi, rdi		; all the calls
+	jz		return			; << this makes it slow, because it is data
+							; dependent, and therefore not predictable.
+							;  n+1 of the left/right pointers will always
+							; be zero, but the sequence that we arrive
+							; at them is kinda random, so if the cpu
+							; always predicts not taken (the better option)
+							; it will be wrong half of the timewith an 
+							; average penalty of 10c/iteration
+	
+	add		eax, [rdi + 16]	; eax accumulates throughout
+	
+	mov		rsi, [rdi + 8]	; read and keep our right node* on the stack
+	push	rsi				; for the second call, so we don't have to
+							; revisit a node
+
+							; the next line also makes it slow, since we cannot 
+							; start address calculation of the next set of reads
+							; until the result of the previous read comes in,
+							; so the full memory request-to-use latency is inside
+							; the loop. depending on cache locality of the next
+							; node, this could be anywhere from 4 to 200 clock cycles,
+							; in which from 20 to 1000 instructions could have
+							; been executed if not for this delay.
+	mov		rdi, [rdi]		; we dont need our own node* again after the
+	call	.internal		; call
+
+	pop		rdi				; get the right node* back from the stack
+	jmp		.internal		; second call replaced with a
+							; jump for tail recursion 
+]
+the stack engine takes care of the implicit push and pop of a call/ret
+but the push/pop/mov,[] of rdi creates a latency chain which includes
+memory reads that must complete before the address of the next read can
+be calculated... and the data dependent branch will likely misspredict
+about 50% of the time...
+
+it can never reliably read ahead, and cannot know where it will be reading
+from, so it cannot queue up reads, and must always wait for them to complete
+and frequently back up when the branch is inevitably predicted incorrectly.
+
+in short, this code, though elegent, cannot flow through the CPU, and will
+on average take about 15cycles per node.
+
+
+What the CPU would prefer you do is convert the recursive problem into an iterative one, where all it has to do is pick up an element from an array and process it in a loop-independent operation:
+
+[onscreen:
+int treesum(node* root)
+{
+	node* wa[root->n_children + 2];
+	wa[0] = root;
+	int waRead = 0;
+	int waWrite = 1;
+	int sum = 0;
+	while(waRead < waWrite)
+	{
+		root = wa[waRead++];
+		sum += root->val;
+		wa[waWrite] = root->left;
+		wa[(waWrite += !!(root->left))] = root->right;
+		waWrite += !!(root->right);
+	}
+	return sum;
+}
+
+This code eschews recursion and instead takes a more dynamic-like approach, unpacking the tree into an array of node pointers and filtering out the nulls, while it is iterating from earlier in that same array of node pointers. Every node in the tree ends up in the array, the array is scanned in a simple element-by-element iteration, and once the writing of that array has got far enough ahead, it will, due to the lack of inter-iteration dependencies (the read-index and sum values get updated once each and the write-index twice, meaning that in a core with enough execution/memory units it could run at two clock cycle per iteration of throughput), or data-dependent branches (the only branch is the looping, which is predictable since it just continues till it's done), saturate the execution units of the core and work at a rate of about 2.8 clock cycles per node, independent of the structure of the tree. [ brackets as on-screen notes ]
+
+taking a closer look at what the cpu is being asked to do:
+[onscreen:
+; node* in rdi
+
+treesum:
+	mov		ecx, [rdi + 20]			; get n-1 child-count of the tree root
+	mov		edx, ecx				; will be our read index
+	not		rcx						; (-rcx)-1
+	lea		rcx, [rsp + rcx * 8]	; space for node* array on stack :: wa
+	mov		eax, [rdi + 16]			; sum = root->val
+	mov		r8d, edx				; write index. starting at top of array.
+.loop:
+	mov		rsi, [rdi]				; left node* read,
+	mov		[rcx + r8 * 8], rsi		; and written.
+	cmp		rsi, 1					; carry set only if rsi == 0
+	adc		r8, -1					; subtract 1 only if carry not set
+
+	mov		rsi, [rdi + 8]			; right node* read,
+	mov		[rcx + r8 * 8], rsi		; and written.
+	cmp		rsi, 1					; carry set only if rsi == 0
+	adc		r8, -1					; subtract 1 only if carry not set
+
+	mov		rdi, [rcx + rdx * 8]	; read node* for next iteration
+	add		eax, [rdi + 16]			; and accumulate its value 
+
+	sub		edx, 1					; growing down
+	jnz		loop					; while read index is nonzero
+
+									; 13µops, 4 read 2 write, 2.6cc/l
+									; last element at edx==1
+
+	ret								; result is already in eax
+									; only used permitted registers
+
+]
+
+let us show how each one traverses the tree in real time, with a basic tree 8 layers deep...
+
+[animation]
+
+It will also vectorise (but only with avx512). 
+
+[avx version]
+
+And vectorising could easily make it 60% as faster. why not more? the limiting factor in this case is that the node values and left/right pointers must be gathered, meaning that each one will be a separate memory read operation, and only 2 can be done per clock cycle. The scalar version has 4 reads per iteration, but the number of instructions means it takes 2.6 cycles per node. The fastest the vector version can manage would be about 1.6 cycles per node (a total of 25 memory read operations per 8-node vector) due to the way that gathers work, but it's still a good example of how avx512 can speed up processes that don't initially look like vectors.
+
+To vectorise this loop, one would need first a vector read from the array and to compute how many of what is read is valid (waWrite - waRead) and convert that into a bitmask in a k-register. Then gather the val's, lefts and rights (into separate registers) from the valid nodes read from the array. Test the lefts and rights for nulls, compress them to get rid of nulls, write to the array. Count the valid entries added. Sum the vals, increment read and write indexes by the number of valid entries, Repeat until read has caught up with write.
+
+A side-effect of this streaming process, vector or otherwise, is that you end up with a complete array of all the node pointers, that can be used in future for other bulk processings of the tree until the tree is mutated, although it's not an in-order array or anything useful like that. The scalar version results in a bredth-first scan going down through the layers, and the vector version can be convinced to do the same with a couple of permutes added in.
+
+Sadly, I think it is easy to see why it's impossible for compilers to do this kind of vectorisation. Firstly, a compiler would have to recognise the intent of the original code-pattern and understand what it is achieving. Secondly, a compiler is not allowed to change the result of the operation in any way, either in its output, or it's side effects. Even memory access ordering can be changed only if it can be proven that it doesn't affect the operations performed. But we'll come to how I think the bulk data processing abilities of avx512 could be made more accessible later.
+
+
+As an example of how versatile avx512 can be, I'm going to use the coding challenge that gained some popularity in mid 2022: a toy puzzle that involves finding all possible combinations of five five-letter words that have no repeated letters, with the starting point of a file that has all english-language words listed in it. It arose from an off-hand comment by the stand-up-maths youtuber, who after having written a quite inefficient program to work this out that took literally weeks to run, on a laptop sitting in the corner plugging away said: "I'm sure someone could improve my code" - and people did. The record as far as I know is about 300µs, held by an australian named Stew Forster, running on 16 cores of 5.6Ghz zen4 machine. I can almost match that with about 400µs, in a single thread on a 4.4Ghz ice-lake cpu using avx512. Almost every step of every process is vectorised, from scanning the file for alphabetic characters, to the final search. How can a combinatorial search be vectorised? In a very simmilar way to the tree-summing example above. But I'm getting ahead of myself.
+
+First we must understand that most of the speed Stew675 achieved is due to the basic efficiency of the search algorithm he employed. The first way to go faster is to do less work, in this case by pre-filtering the search space so not every subsearch of every search has to scan the entire list of 6000 5-letter words - a naive search space of over 7,000,000,000,000,000,000, which even at 1ns per test would still take 222 years.
+
+The first step, though, is to find the 5-letter words in a file that lists ALL words. After that, we can filter out all words with repeating letters, and then any that are anagrams of others by entering them in a hashtable for later lookup, then count the total occurrence of each letter in the remaining set and rank the letters, then convert the words to bit-patterns that we can fit round each other in the search, then sort the bit-patterns into layers according to their least popular letter, then sort within the layers into sub-groups according to the absence of the most popular 6 letters... and then the search can finally begin, building up keys by starting with the least popular letter layer and then adding words from the next least popular not-yet-included letter's layer, using which of the most-popular 6 letters are already present in the key to select a subgroup that doesn't to actually use for the search, and storing any sequences that manage to fit 5 words into the key. In Stew's version this is done recursively, but as we've seen, recursion cannot be vectorised (much), until it is converted to a streaming process. All of these processes can, and have been, efficiently vectorised using avx512 in my version of Stews algorithm. I'll go through them in order.
+
+**********************************
+WORD DISCOVERY ... or file parsing
+**********************************
+
+the first step of the first step is letter - or non-letter - discovery.
+load 64 bytes of memory, subtract 'A', clear bit5 (andn32), if the result is >25 it's not a letter. Store the results as a continuous bit-field for the entire file (64 bytes -> 64 bits).
+
+now we need to find groups of 5 letters with non-letters at either end. since 1-bits in the bit-field represent non-letter characters, we're looking for the sequence 1000001. To find it I elected for a series of double-shifts, where the extra bits were coming from the next dword accross that was pre-aligned to the matching element, followed by ternlog's for sequence matching. This enables the process to work continuously over the entire file.
+
+a		1000001
+b	   1000001		a<<1
+c	  1000001		a<<2
+d	 1000001		a<<3
+e	1000001			a<<4
+f  1000001			a<<5
+g 1000001			a<<6
+h       1			matching 100 in abc
+i       1			matching 001 in efg
+j		1			matching 101 in hdi			<- result
+
+simultaneously, a register of indexes for this currently continuous bitfield is being maintained by counting as we scan. Since most of the file doesn't have 5-letter words in it (theres about 15000 total out of 300000 words in 4Mb), we can (and must) discard the blank space using compress, and store the indexes so we know where the bits are actually pointing.
+
+now we need to convert the bitfield into a list of indexes to 5-letter words. Since avx only has lzcnt for bit-discovery, we use that, generating exactly 16 discovered words (every dword element remaining after last step has at least one bit) and using the stored indexes for reference. We and then clear the discovered bit, after which some elements will now be blank so we can (and must) discard them before writing back the shorter list of bitfields and indexes. This continues until we have no bitfield bits remaining, and have a complete list of indexes to 5-letter words in the file.
+
+***************
+LETTER COUNTING ... or data filtering
+***************
+
+Before a final meaningful population count of the letters in the data set can be made, two filtering operations have to be done. One for multiples of letters in the word, one for anagrams within the dataset. The first happens quite naturally during a preliminary step to the counting, where the words are converted into bit-patterns for easy counting of the letters. We can just popcnt the resulting codes and if popcnt != 5, discard it and its index. I elected to also replace the index with a compressed representation of the word (so that future processes wouldn't need to gather it back in from the file) since each letter only actually needs 5 bits. This reduces the wordcount to about 10000.
+
+Counting is done via an operation I call a Bit Block Rotation, something I've used a few times in this program for different purposes. The process shuffles bits together in such a way that all the bit0's from all the elements arrive in element0 of the result, all bit1's in element1 etc.. I visualize this as all the bits in the source register getting packed by element layers into a rectangular block, which is then rotated by 90° before being unpacked by element layers into the destination[, hence the name, though I think it's more like a matrix transposition than rotation (== diagonal flip)]?. This takes about 8 instructions to do, using byte permutes, multishiftqb (which allows each byte within a quadword to select an arbitrary 8-bit group from the source quadword) and ternlog again, this time as a bit-granular blend function (c?b:a). After this, the 32 word elements of the output can be popcnt'd and the results accumulated.
+
+*************
+  HASHTABLE   ... or uniqueness filtering
+*************
+
+But before the counting, the second filtering operation needs to be done, which is done by adding all words into a hashtable.
+
+First the hashes are calculated, based on the bit-codes for each word.
+
+Then we repeatedly scan through the list of remaining unentered entries, checking that the space is blank (gather), before either writing it into the space (masked scatter) or returning it to the list (using compress) with an incremented hash.
+
+In addition to this, codes who find themselves looking at another identical code while looking for their place in the hashtable get marked, and only unmarked successful hashtable entries get transferred to the final search list of non-anagrammed codes. The marked words are still entered in the hashtable though, since it will be used for results output and we would like to know all the words that fit, not just one of each letter combination. The final search list has just under 6000 distinct letter combinations in it.
+
+Rather than using the avx512 conflict-detecting instruction, which is incredibly slow, regathering and comparing what was written seems more appropriate. This also allows thorough anagram checking.
+
+***************************
+ SEARCH BITMASK GENERATION
+***************************
+
+Although we've already turned the words into bitmasks once, we have to do it again, since there's a very important function that can be performed only if the bits used to represent the words are ordered by their counts as made in the previous process - that is that lzcnt can directly tell us what the least popular letter in a word is. This gets used in the sorting, and more importantly during the search where lzcnt of the inverted mask can tell us directly what the next letter layer (the least popular unset bit in the current key) to search should be, and the most popular letters (used for the subgroup selection) are all grouped together as well. This saves far more time in the search than it takes to do (by a factor of 100 or more).
+
+In order to create this bit-ordering, the letters of the words can select from 32 dword elements with the correct bit for each letter using a 2-table permute, and combine them together (ternlog again - as a 3-input or). Those bit tables are generated by turning the counts into a ranking by simply comparing them all, then using that ranking to shift a bit into position.
+
+This bit-ranking is also later used for reordering the bits from the search result to match what was hashed for the hashtable.
+
+*********
+  SORTS	  ... or, putting things into piles
+*********
+
+the first sort is by the 2 most popular letters, into 4 sections, such that the 2 search-groups that don't have one or other of the letters end up contiguous by overlapping the section that doesn't have both of them. this allows 4 separate search-groups to coexist in the space of the largest one of them. Since the average number of elements that will be entered into each section from each vector of 16 codes is 4, it is more efficient to handle by compress (resulting in 4 memory writes per loop) than by scatter (16 memory writes per loop). the efficiency of compress is reduced in the icelake implementation by compress instructions taking 3 cycles and not being pipelined, meaning that 4 compresses takes 12 cycles, but that's still better than 16, and I think this will be fixed in the future so that compress has the same throughput as other permutes, so it could get much more worthwhile.
+
+the second sort is by the least popular letter, which is now the leftmost set bit, into 26 (actually 22, since no word can have it's least popular letter be one of the most popular 4 letters if there's no repeated letter). This still isn't 16, so we have to use a 32-pile process with a number of empty piles at the end, but it's still small enough that we don't need to use memory for the index counters, which can live in 2 registers instead.
+
+both of these sorts require pre-counting. Pile counting is done through the conversion of each code into a bit-representation of which pile it'll be in (keep only leftmost bit) followed by the Bit-Block-Rotate;popcnt;add operation previously described. Since there are enough spare bits left in the count for the second sort, the count for the first sort can be included in the same operation.
+
+the scatter for the second sort needs de-conflicting, but the vpconflictd operation needs 37 vector µops for 16 elements and doesn't provide all the information we need for an in-register index table where elements select their index by permute. It generates the increments for the indexes in the data columns, but that isn't the right columns for updating the index table itself ... so I used a Bit-Block-Rotate operation instead. If you turn the column selections into bits (1-of-32) then you can bit-block rotate them into 32 16-bit masks of which data elements are selecting each index source. For the index increments one just popcnt's them directly, and for the deconflict, one permutes the bitmasks back to the selecting columns with the same permute table that is used to permute the indexes, and then masks for bits from only columns to the right, a window expanding from right to left. Then popcnt what remains and add it to the permute-selected indexes. This sounds complex but results in 3x less µops used for the deconflict process, and only the actual data elements need to be written to memory.
+
+the final sorting process is the pre-filtering expansion of the letter groups into 15 extra subgroups for each letter, filtered for relevence to keys that already contain one or more of the next most popular 4 letters after the most popular 2. This is done by using compress to successively filter off one bit at a time into new shorter subgroups.
+
+
+*******************************************************
+
+**************
+  THE SEARCH		... or, making it all flow
+**************
+
+A recursive combinatorial search is full of data-dependent branches, and the CPU spends MOST OF ITS TIME dealing with the consequent branch misspredictions, as well as waiting for the data they depend upon to be fetched from memory. it's a slow process with lots of backing out of dead-ends and waiting around. As I already hinted, the solution to this is to turn it into an expanding list of work, and process this list till the readpoint catches up with the writepoint. This leaves only one data-dependent branch in the process - the length of the search group and the consequent number of iterations in the search loop. This can also be mitigated by sorting the work into piles of equal numbers of iterations before starting to actually process them, resulting in a fully vectorised, loop-concurrent, piplined and flowing search process, taking about 330µs to cover the 225000 search options that the algorithm looks through.
+
+the flowsearch process cycles back and forth between two processes:
+- scanning the work in the main pile to determine which search group each item will scan, determining how many iterations of the 16-at-a-time vectorised search loop will need to happen, and placing the work into that pile, tagged with which search-group it will be searching so as to not lose that not-insignificant ammount of work
+- running down through those piles of keys, scanning the search-groups for any word-codes that fit into the missing bits in the key.
+
+The search is made useful by keeping a record, aligned with each successful key, of which key was its parent. This allows the word combinations to be extracted at the end, which will after all always be the same result: a solid block of bits. By looking at the bit difference of each key from it's parent, one can extract which bits were successfuly added to make that key.
+
+In the first process, the letter group to be searched is extracted simply with lzcnt of the inverted key (find leftmost unset bit). The prefiltered subgroup number is already collected at the start of the key, so simply combining these two numbers is enough to get an 11-bit search group index. the groups lengths get gathered and shifted to determine the pile they should be sorted into.
+
+There are only 16 piles (iterations past 15 are very rare so they all get put into the last pile) so one Bit-Block-Rotate allows a 32 into 16 deconflict operation, and work elements are processed and sorted into piles 32-at-a-time. This process approaches saturation of the memory-write hardware that can only write to one memory location per clock cycle in this situation, taking 35.5 clock-cycles per 32 work elements.
+
+In the second process, the work elements are taken one by one from the sorted piles (the only scalar part of the entire process) and then the appropriate search-group scanned using vector bit-testing of 16 word-masks against the broadcasted key. Compress then filters to only the accepted keys and writes them back, combined with the accepted words, to the main work array, with the parent key written to the history array. The pile for 0-iteration searches (~15% of the search) is ignored.
+
+This cycling divides the process into clear stages: the first stage takes the 5-bit keys copied from the initial search group (all codes from the least popular letter group) and converts them to 10-bit keys. the second stage converts all the 10-bit keys to 15-bit keys, then 20-bit, then 25-bit solutions. The 25-of-26 nature of the problem allows for one letter to be skipped, so we then take the entire unskipped search and redo it, adding one extra bit at the leftmost unset bit during the first stage, generating 6-bit, 11-bit, 16-bit, 21-bit keys for searching and 26-bit solutions. The sort from here on is modified slightly so that the 26-bit codes get put in the last pile and not reprocessed. We then do 3 more stages, adding 5 bits each time and pulling out solutions until it's all done, and we have a pile that contains the solution indexes that can be used to extract the solutions from the work history, and then get the words from the hashtable to report them.
+
+**********************************************
+
+So what have we learned? First I would say we've learned that avx512 can make complex integer data processing faster by as much as multithreading can, though success in this is largely a matter of how the problem is framed: if it can be turned into flowing data and code, then speed can be vastly improved. Second, working out how not to cause memory-latency and branch-misspredict holdups is a good first step towards vectorisability. Third, expecting compilers to do this for us is unreasonable.
+
+I wrote the 5x5words code described above many times over in nasm assembler, assessing in detail the code and memory flow dynamics of each method investigated before progressing to the next method, and the next ... before finaly deciding on which one to use, changing data arangements and even rearranging the division and ordering of the tasks to best fit them together. Although compilers can't be expected to do that by themselves, I can imagine how a suitable set of second-order functions for vectorised processing of bulk data types, with special data types for the lambdas, could enable simmilar code patterns to be used widely with very little effort and only basic understanding, and get nearly as much benefit, guiding programmers to think in ways that enable the use of those patterns as a concequence.
+
+The only problem with avx512 is that not everyone has it. Older, and newer intel CPU's, older AMD cpus, and all other ISAs, don't have avx512 capabilities. avx2 doesn't have most of the features that enable the kind of code patterns I've described (no scatter, compress, ternlog, kmasks, many permutes missing...). Most vector ISAs focus on floating-point raw numbers, Xflops, and nothing else. 
+
+But avx512 dreams of being more than just a number cruncher, making vast numbers of decisions far faster than scalar code can, if only the languages could manage it...
+
